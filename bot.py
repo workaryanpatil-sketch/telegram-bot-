@@ -34,6 +34,7 @@ SUPABASE_URL = "https://veyesmsdlyaooepvkjmr.supabase.co"
 QUESTIONS_TABLE_URL = f"{SUPABASE_URL}/rest/v1/questions"
 USERS_TABLE_URL = f"{SUPABASE_URL}/rest/v1/users"
 USER_QUESTIONS_URL = f"{SUPABASE_URL}/rest/v1/user_questions"
+BROADCAST_READS_URL = f"{SUPABASE_URL}/rest/v1/broadcast_reads"
 
 HEADERS = {
     "apikey": "sb_publishable_98PpqkF49oh36BAQYIFB1A_hA0vl0-7",
@@ -645,7 +646,187 @@ async def broadcast_ack_handler(update: Update, context: ContextTypes.DEFAULT_TY
     
     # Optional: Remove the button after clicking
     await query.edit_message_reply_markup(reply_markup=None)
-    
+
+async def mbroadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Usage:
+      /mbroadcast Your text message         ← text only
+      /mbroadcast Your caption              ← reply to a photo/video with this
+    """
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("⛔ Not authorized.")
+        return
+
+    import time
+    broadcast_id = f"bc_{int(time.time())}"
+
+    # Determine caption/text
+    caption = " ".join(context.args) if context.args else ""
+
+    # Detect media from replied-to message
+    replied = update.message.reply_to_message
+    media_type = None
+    file_id = None
+
+    if replied:
+        if replied.photo:
+            media_type = "photo"
+            file_id = replied.photo[-1].file_id  # highest resolution
+        elif replied.video:
+            media_type = "video"
+            file_id = replied.video.file_id
+        elif replied.document:
+            media_type = "document"
+            file_id = replied.document.file_id
+
+    if not caption and not file_id:
+        await update.message.reply_text(
+            "❌ Usage:\n"
+            "• Text only: /mbroadcast Your message\n"
+            "• With media: Reply to a photo/video with /mbroadcast Your caption"
+        )
+        return
+
+    # Fetch all users
+    try:
+        response = requests.get(f"{USERS_TABLE_URL}?select=user_id", headers=HEADERS, timeout=30)
+        response.raise_for_status()
+        users = response.json()
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to fetch users: {e}")
+        return
+
+    if not users:
+        await update.message.reply_text("❌ No users found.")
+        return
+
+    # "Mark as Read" button
+    keyboard = [[InlineKeyboardButton("✅ Mark as Read", callback_data=f"read_{broadcast_id}")]]
+    markup = InlineKeyboardMarkup(keyboard)
+
+    success, fail = 0, 0
+    status_msg = await update.message.reply_text(
+        f"📢 Broadcasting to {len(users)} users...\nProgress: 0/{len(users)}"
+    )
+
+    for idx, user in enumerate(users):
+        uid = user["user_id"]
+        try:
+            if media_type == "photo":
+                await context.bot.send_photo(uid, file_id, caption=caption or None, reply_markup=markup)
+            elif media_type == "video":
+                await context.bot.send_video(uid, file_id, caption=caption or None, reply_markup=markup)
+            elif media_type == "document":
+                await context.bot.send_document(uid, file_id, caption=caption or None, reply_markup=markup)
+            else:
+                await context.bot.send_message(uid, caption, reply_markup=markup)
+            success += 1
+        except Exception:
+            fail += 1
+
+        if (idx + 1) % 10 == 0 or (idx + 1) == len(users):
+            try:
+                await status_msg.edit_text(
+                    f"📢 Broadcasting...\nProgress: {idx+1}/{len(users)}\n✅ {success}  ❌ {fail}"
+                )
+            except:
+                pass
+
+    await status_msg.edit_text(
+        f"✅ Broadcast Complete!\n\n"
+        f"Total: {len(users)} | ✅ Sent: {success} | ❌ Failed: {fail}\n\n"
+        f"📋 Broadcast ID: `{broadcast_id}`\n"
+        f"Use /resend {broadcast_id} to re-send to users who haven't read it.",
+        parse_mode="Markdown"
+    )
+
+async def mark_read_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("✅ Marked as read!")
+
+    user = query.from_user
+    broadcast_id = query.data.split("_", 1)[1]
+
+    # Save to broadcast_reads table
+    try:
+        requests.post(
+            BROADCAST_READS_URL,
+            headers={**HEADERS, "Prefer": "resolution=ignore-duplicates"},
+            json={"broadcast_id": broadcast_id, "user_id": user.id},
+            timeout=10
+        )
+    except:
+        pass
+
+    # Notify admin
+    try:
+        await context.bot.send_message(
+            ADMIN_ID,
+            f"📖 Message Read!\n📋 ID: {broadcast_id}\n"
+            f"👤 {user.first_name} (@{user.username or 'N/A'})\n🆔 {user.id}"
+        )
+    except:
+        pass
+
+    # Remove button so they can't click twice
+    await query.edit_message_reply_markup(reply_markup=None)
+
+async def resend_unread(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /resend <broadcast_id> Your reminder message"""
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Not authorized.")
+        return
+
+    if not context.args or len(context.args) < 1:
+        await update.message.reply_text("Usage: /resend <broadcast_id> Optional reminder text")
+        return
+
+    broadcast_id = context.args[0]
+    reminder_text = " ".join(context.args[1:]) or "📢 You missed our last message! Please check it."
+
+    # Get all users
+    try:
+        all_users_resp = requests.get(f"{USERS_TABLE_URL}?select=user_id", headers=HEADERS, timeout=30)
+        all_users_resp.raise_for_status()
+        all_user_ids = {u["user_id"] for u in all_users_resp.json()}
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to fetch users: {e}")
+        return
+
+    # Get users who already read
+    try:
+        read_resp = requests.get(
+            f"{BROADCAST_READS_URL}?broadcast_id=eq.{broadcast_id}&select=user_id",
+            headers=HEADERS, timeout=30
+        )
+        read_resp.raise_for_status()
+        read_ids = {r["user_id"] for r in read_resp.json()}
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to fetch read data: {e}")
+        return
+
+    unread_ids = all_user_ids - read_ids
+
+    if not unread_ids:
+        await update.message.reply_text("🎉 Everyone has read the message!")
+        return
+
+    await update.message.reply_text(f"🔁 Resending to {len(unread_ids)} unread users...")
+
+    keyboard = [[InlineKeyboardButton("✅ Mark as Read", callback_data=f"read_{broadcast_id}")]]
+    markup = InlineKeyboardMarkup(keyboard)
+
+    success, fail = 0, 0
+    for uid in unread_ids:
+        try:
+            await context.bot.send_message(uid, reminder_text, reply_markup=markup)
+            success += 1
+        except:
+            fail += 1
+
+    await update.message.reply_text(f"✅ Resend done! Sent: {success} | Failed: {fail}")
+
 async def share_tracking_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -674,6 +855,9 @@ def main():
     app.add_handler(CallbackQueryHandler(faceoff_answer_handler, pattern="^fo_"))
     app.add_handler(CallbackQueryHandler(self_answer_handler, pattern="^self_"))
     app.add_handler(CallbackQueryHandler(subject_handler))
+    app.add_handler(CommandHandler("mbroadcast", mbroadcast))
+    app.add_handler(CommandHandler("resend", resend_unread))
+    app.add_handler(CallbackQueryHandler(mark_read_handler, pattern="^read_"))
 
     print("🤖 Bot running...")
     app.run_polling()
