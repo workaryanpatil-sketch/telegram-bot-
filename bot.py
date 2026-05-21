@@ -672,7 +672,7 @@ async def mbroadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if replied:
         if replied.photo:
             media_type = "photo"
-            file_id = replied.photo[-1].file_id  # highest resolution
+            file_id = replied.photo[-1].file_id
         elif replied.video:
             media_type = "video"
             file_id = replied.video.file_id
@@ -690,10 +690,10 @@ async def mbroadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Fetch all users
     try:
-    users = fetch_all_users()
-except Exception as e:
-    await update.message.reply_text(f"❌ Failed to fetch users: {e}")
-    return
+        users = fetch_all_users()
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to fetch users: {e}")
+        return
 
     if not users:
         await update.message.reply_text("❌ No users found.")
@@ -722,6 +722,8 @@ except Exception as e:
             success += 1
         except Exception:
             fail += 1
+
+        await asyncio.sleep(0.05)
 
         if (idx + 1) % 10 == 0 or (idx + 1) == len(users):
             try:
