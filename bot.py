@@ -772,6 +772,38 @@ async def mark_read_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Remove button so they can't click twice
     await query.edit_message_reply_markup(reply_markup=None)
 
+def fetch_all_users():
+    """Fetches all users from Supabase, bypassing the 1000 row limit."""
+    all_users = []
+    offset = 0
+    limit = 1000
+
+    while True:
+        try:
+            response = requests.get(
+                f"{USERS_TABLE_URL}?select=user_id&limit={limit}&offset={offset}",
+                headers=HEADERS,
+                timeout=30
+            )
+            response.raise_for_status()
+            batch = response.json()
+
+            if not batch:
+                break
+
+            all_users.extend(batch)
+
+            if len(batch) < limit:
+                break
+
+            offset += limit
+
+        except Exception as e:
+            raise Exception(f"Failed at offset {offset}: {e}")
+
+    return all_users
+
+
 async def resend_unread(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Usage: /resend <broadcast_id> Your reminder message"""
     if update.effective_user.id != ADMIN_ID:
@@ -787,10 +819,10 @@ async def resend_unread(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Get all users
     try:
-    all_user_ids = {u["user_id"] for u in fetch_all_users()}
-except Exception as e:
-    await update.message.reply_text(f"❌ Failed to fetch users: {e}")
-    return
+        all_user_ids = {u["user_id"] for u in fetch_all_users()}
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to fetch users: {e}")
+        return
 
     # Get users who already read
     try:
@@ -823,39 +855,10 @@ except Exception as e:
         except:
             fail += 1
 
+        await asyncio.sleep(0.05)
+
     await update.message.reply_text(f"✅ Resend done! Sent: {success} | Failed: {fail}")
-
-def fetch_all_users():
-    """Fetches all users from Supabase, bypassing the 1000 row limit."""
-    all_users = []
-    offset = 0
-    limit = 1000
-
-    while True:
-        try:
-            response = requests.get(
-                f"{USERS_TABLE_URL}?select=user_id&limit={limit}&offset={offset}",
-                headers=HEADERS,
-                timeout=30
-            )
-            response.raise_for_status()
-            batch = response.json()
-
-            if not batch:
-                break
-
-            all_users.extend(batch)
-
-            if len(batch) < limit:
-                break  # last page
-
-            offset += limit
-
-        except Exception as e:
-            raise Exception(f"Failed at offset {offset}: {e}")
-
-    return all_users
-
+    
 async def share_tracking_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
