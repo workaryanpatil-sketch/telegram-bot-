@@ -87,11 +87,14 @@ def webhook():
     json_data = request.get_json(force=True)
     update = Update.de_json(json_data, ptb_app.bot)
 
-    # Run the update through PTB's async machinery in a sync context
+    async def process():
+        async with ptb_app:
+            await ptb_app.process_update(update)
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(ptb_app.process_update(update))
+        loop.run_until_complete(process())
     finally:
         loop.close()
 
