@@ -1,16 +1,22 @@
 import asyncio
 import random
+import os
+import time
+import hmac
+import hashlib
+from flask import Flask, request, abort
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     ContextTypes, MessageHandler, filters
 )
 import requests
-import os
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN not set")
+
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # optional but recommended
 
 ADMIN_ID = 1376681483
 
@@ -18,7 +24,7 @@ FACE_OFF_QUEUE = []
 ACTIVE_MATCHES = {}
 
 QUESTION_TIME = 30
-FACE_OFF_FINISH_WAIT = 60  # seconds
+FACE_OFF_FINISH_WAIT = 60
 
 CLASS_SUBJECTS = {
     "1st": ["Anatomy", "Physiology", "Biochemistry"],
@@ -46,7 +52,7 @@ MOTIVATIONAL_MESSAGE = (
     "👉 Press /start to solve more PYQs and keep the streak 🔥 alive.\n\n"
     "/feedback if want to report a bug or problem with bot.\n\n"
     "/share please share the bot to more med students to keep this bot alive.\n\n"
-) 
+)
 
 INSTAGRAM_MESSAGE = (
     "🌟 Want more? We've got you covered!\n\n"
@@ -57,6 +63,63 @@ INSTAGRAM_MESSAGE = (
     "👉 https://www.instagram.com/pyrexiamed\n\n"
     "Join the community & level up your prep! 🚀"
 )
+
+# ================= FLASK APP =================
+flask_app = Flask(__name__)
+
+# Build the PTB Application once at module load
+ptb_app = Application.builder().token(BOT_TOKEN).build()
+
+
+@flask_app.route("/")
+def index():
+    return "MedRoyale Bot is running! 🤖", 200
+
+
+@flask_app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
+def webhook():
+    # Optional: verify Telegram's secret token header
+    if WEBHOOK_SECRET:
+        secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if secret_header != WEBHOOK_SECRET:
+            abort(403)
+
+    json_data = request.get_json(force=True)
+    update = Update.de_json(json_data, ptb_app.bot)
+
+    # Run the update through PTB's async machinery in a sync context
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(ptb_app.process_update(update))
+    finally:
+        loop.close()
+
+    return "OK", 200
+
+
+@flask_app.route("/set_webhook")
+def set_webhook():
+    """
+    Visit  https://<your-vercel-url>/set_webhook  once after deploying
+    to register the webhook with Telegram.
+    """
+    vercel_url = os.getenv("VERCEL_URL", "")
+    if not vercel_url:
+        return "Set the VERCEL_URL env var first (e.g. your-project.vercel.app)", 400
+
+    webhook_url = f"https://{vercel_url}/webhook/{BOT_TOKEN}"
+    params = {"url": webhook_url}
+    if WEBHOOK_SECRET:
+        params["secret_token"] = WEBHOOK_SECRET
+
+    resp = requests.get(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
+        params=params,
+        timeout=10
+    )
+    return resp.json()
+
 
 # ================= USER STORAGE =================
 def save_user(user):
@@ -196,21 +259,19 @@ async def start_self_quiz(chat_id, context):
 
 
 async def self_question_timer(chat_id, context):
-    """30-second countdown timer for self-mode questions"""
     timer_msg = await context.bot.send_message(chat_id, "⏱️ Time left: 30s")
     context.user_data["timer_msg_id"] = timer_msg.message_id
-    
+
     for remaining in range(29, -1, -1):
         await asyncio.sleep(1)
-        
-        # Check if question was already answered
+
         if context.user_data.get("answered"):
             try:
                 await context.bot.delete_message(chat_id, timer_msg.message_id)
             except:
                 pass
             return
-        
+
         try:
             await context.bot.edit_message_text(
                 chat_id=chat_id,
@@ -219,18 +280,17 @@ async def self_question_timer(chat_id, context):
             )
         except:
             pass
-    
-    # Time's up - auto-skip if not answered
+
     if not context.user_data.get("answered"):
         context.user_data["answered"] = True
         try:
             await context.bot.delete_message(chat_id, timer_msg.message_id)
         except:
             pass
-        
+
         await context.bot.send_message(chat_id, "⏰ Time's up!")
         await asyncio.sleep(1)
-        
+
         context.user_data["current_q"] += 1
         await send_self_question(chat_id, context)
 
@@ -268,8 +328,6 @@ async def send_self_question(chat_id, context):
                 for o in ["A", "B", "C", "D"]]
 
     await context.bot.send_message(chat_id, text, reply_markup=InlineKeyboardMarkup(keyboard))
-    
-    # Start timer for this question
     context.user_data["timer_task"] = asyncio.create_task(self_question_timer(chat_id, context))
 
 
@@ -288,7 +346,6 @@ async def self_answer_handler(update, context):
     correct = context.user_data["correct"]
     context.user_data["answered"] = True
 
-    # Delete timer message
     if context.user_data.get("timer_msg_id"):
         try:
             await context.bot.delete_message(
@@ -495,18 +552,18 @@ async def end_faceoff(match_id, context):
         f"{m1}\nScore: {p1['score']} – {p2['score']}\n\n{MOTIVATIONAL_MESSAGE}"
     )
     await context.bot.send_message(p1["chat_id"], INSTAGRAM_MESSAGE, parse_mode="Markdown")
-    
+
     await context.bot.send_message(
         p2["chat_id"],
         f"{m2}\nScore: {p2['score']} – {p1['score']}\n\n{MOTIVATIONAL_MESSAGE}"
     )
     await context.bot.send_message(p2["chat_id"], INSTAGRAM_MESSAGE, parse_mode="Markdown")
 
+
 # ================= SHARE =================
 async def share(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    
-    # Send notification to admin when /share command is used
+
     try:
         await context.bot.send_message(
             chat_id=ADMIN_ID,
@@ -516,7 +573,7 @@ async def share(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except:
         pass
-    
+
     share_text = (
         "🏥 *MedRoyale Bot* 🏥\n\n"
         "📚 The ultimate NEET PYQ practice bot!\n\n"
@@ -530,40 +587,36 @@ async def share(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🚀 Start practicing now: @Medroyalebot\n\n"
         "💪 Master NEET PYQs one question at a time!"
     )
-    
-    # Share button with inline query (opens share window)
+
     keyboard = [[
         InlineKeyboardButton("🤖 Try the Bot", url="https://t.me/Medroyalebot"),
         InlineKeyboardButton("📤 Share", switch_inline_query=share_text)
     ]]
-    
+
     await update.message.reply_text(
         share_text,
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
+
 # ================= BROADCAST =================
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    
+
     if user_id != ADMIN_ID:
         await update.message.reply_text("⛔ You are not authorized to use this command.")
         return
-    
+
     if not context.args:
         await update.message.reply_text(
-            "❌ Please provide a message to broadcast.\n\n"
-            "Usage: /broadcast Your message here"
+            "❌ Please provide a message to broadcast.\n\nUsage: /broadcast Your message here"
         )
         return
-    
+
     broadcast_message = " ".join(context.args)
-    
-    # Generate unique broadcast ID
-    import time
     broadcast_id = f"bc_{int(time.time())}"
-    
+
     try:
         response = requests.get(
             f"{USERS_TABLE_URL}?select=user_id",
@@ -575,22 +628,20 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Failed to fetch users: {str(e)}")
         return
-    
+
     if not users:
         await update.message.reply_text("❌ No users found in database.")
         return
-    
+
     success_count = 0
     fail_count = 0
-    
+
     status_msg = await update.message.reply_text(
-        f"📢 Broadcasting to {len(users)} users...\n"
-        f"Progress: 0/{len(users)}"
+        f"📢 Broadcasting to {len(users)} users...\nProgress: 0/{len(users)}"
     )
-    
-    # Add acknowledgment button
+
     keyboard = [[InlineKeyboardButton("✅ Got it!", callback_data=f"ack_{broadcast_id}")]]
-    
+
     for idx, user in enumerate(users):
         try:
             await context.bot.send_message(
@@ -602,7 +653,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             success_count += 1
         except Exception:
             fail_count += 1
-        
+
         if (idx + 1) % 10 == 0 or (idx + 1) == len(users):
             try:
                 await status_msg.edit_text(
@@ -613,7 +664,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except:
                 pass
-    
+
     await status_msg.edit_text(
         f"✅ Broadcast Complete!\n\n"
         f"Total Users: {len(users)}\n"
@@ -624,15 +675,13 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# Handler for acknowledgment button
 async def broadcast_ack_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("✅ Thanks for acknowledging!")
-    
+
     user = query.from_user
     broadcast_id = query.data.split("_", 1)[1]
-    
-    # Notify admin
+
     try:
         await context.bot.send_message(
             chat_id=ADMIN_ID,
@@ -643,28 +692,19 @@ async def broadcast_ack_handler(update: Update, context: ContextTypes.DEFAULT_TY
         )
     except:
         pass
-    
-    # Optional: Remove the button after clicking
+
     await query.edit_message_reply_markup(reply_markup=None)
 
+
 async def mbroadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Usage:
-      /mbroadcast Your text message         ← text only
-      /mbroadcast Your caption              ← reply to a photo/video with this
-    """
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
         await update.message.reply_text("⛔ Not authorized.")
         return
 
-    import time
     broadcast_id = f"bc_{int(time.time())}"
-
-    # Determine caption/text
     caption = " ".join(context.args) if context.args else ""
 
-    # Detect media from replied-to message
     replied = update.message.reply_to_message
     media_type = None
     file_id = None
@@ -688,7 +728,6 @@ async def mbroadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Fetch all users
     try:
         users = fetch_all_users()
     except Exception as e:
@@ -699,7 +738,6 @@ async def mbroadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ No users found.")
         return
 
-    # "Mark as Read" button
     keyboard = [[InlineKeyboardButton("✅ Mark as Read", callback_data=f"read_{broadcast_id}")]]
     markup = InlineKeyboardMarkup(keyboard)
 
@@ -741,6 +779,7 @@ async def mbroadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+
 async def mark_read_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("✅ Marked as read!")
@@ -748,7 +787,6 @@ async def mark_read_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = query.from_user
     broadcast_id = query.data.split("_", 1)[1]
 
-    # Save to broadcast_reads table
     try:
         requests.post(
             BROADCAST_READS_URL,
@@ -759,7 +797,6 @@ async def mark_read_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
-    # Notify admin
     try:
         await context.bot.send_message(
             ADMIN_ID,
@@ -769,11 +806,10 @@ async def mark_read_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
-    # Remove button so they can't click twice
     await query.edit_message_reply_markup(reply_markup=None)
 
+
 def fetch_all_users():
-    """Fetches all users from Supabase, bypassing the 1000 row limit."""
     all_users = []
     offset = 0
     limit = 1000
@@ -805,7 +841,6 @@ def fetch_all_users():
 
 
 async def resend_unread(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Usage: /resend <broadcast_id> Your reminder message"""
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⛔ Not authorized.")
         return
@@ -817,14 +852,12 @@ async def resend_unread(update: Update, context: ContextTypes.DEFAULT_TYPE):
     broadcast_id = context.args[0]
     reminder_text = " ".join(context.args[1:]) or "📢 You missed our last message! Please check it."
 
-    # Get all users
     try:
         all_user_ids = {u["user_id"] for u in fetch_all_users()}
     except Exception as e:
         await update.message.reply_text(f"❌ Failed to fetch users: {e}")
         return
 
-    # Get users who already read
     try:
         read_resp = requests.get(
             f"{BROADCAST_READS_URL}?broadcast_id=eq.{broadcast_id}&select=user_id",
@@ -858,14 +891,14 @@ async def resend_unread(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(0.05)
 
     await update.message.reply_text(f"✅ Resend done! Sent: {success} | Failed: {fail}")
-    
+
+
 async def share_tracking_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
+
     user = query.from_user
-    
-    # Send notification to admin
+
     try:
         await context.bot.send_message(
             chat_id=ADMIN_ID,
@@ -876,24 +909,23 @@ async def share_tracking_handler(update: Update, context: ContextTypes.DEFAULT_T
     except:
         pass
 
-# ================= MAIN =================
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-    
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("share", share))
-    app.add_handler(CommandHandler("broadcast", broadcast))
-    app.add_handler(CallbackQueryHandler(broadcast_ack_handler, pattern="^ack_"))
-    app.add_handler(CallbackQueryHandler(faceoff_answer_handler, pattern="^fo_"))
-    app.add_handler(CallbackQueryHandler(self_answer_handler, pattern="^self_"))
-    app.add_handler(CallbackQueryHandler(subject_handler))
-    app.add_handler(CommandHandler("mbroadcast", mbroadcast))
-    app.add_handler(CommandHandler("resend", resend_unread))
-    app.add_handler(CallbackQueryHandler(mark_read_handler, pattern="^read_"))
 
-    print("🤖 Bot running...")
-    app.run_polling()
+# ================= REGISTER HANDLERS =================
+ptb_app.add_handler(CommandHandler("start", start))
+ptb_app.add_handler(CommandHandler("share", share))
+ptb_app.add_handler(CommandHandler("broadcast", broadcast))
+ptb_app.add_handler(CommandHandler("mbroadcast", mbroadcast))
+ptb_app.add_handler(CommandHandler("resend", resend_unread))
+ptb_app.add_handler(CallbackQueryHandler(broadcast_ack_handler, pattern="^ack_"))
+ptb_app.add_handler(CallbackQueryHandler(faceoff_answer_handler, pattern="^fo_"))
+ptb_app.add_handler(CallbackQueryHandler(self_answer_handler, pattern="^self_"))
+ptb_app.add_handler(CallbackQueryHandler(mark_read_handler, pattern="^read_"))
+ptb_app.add_handler(CallbackQueryHandler(subject_handler))
 
+# ================= WSGI ENTRYPOINT =================
+# Vercel looks for `app` (Flask WSGI object) in this file
+app = flask_app
 
 if __name__ == "__main__":
-    main()
+    # Local development: use polling instead of webhook
+    ptb_app.run_polling()
