@@ -4,6 +4,7 @@ import os
 import time
 import hmac
 import hashlib
+from datetime import datetime, timedelta, timezone
 from flask import Flask, request, abort
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -36,11 +37,18 @@ CLASS_SUBJECTS = {
 QUESTIONS_PER_MATCH = 5
 QUESTIONS_PER_QUIZ = 5
 
+# ============== DAILY QUIZ LIMIT / UPSELL ==============
+DAILY_QUIZ_LIMIT = 3  # full quizzes (5 Qs each) per user per day, across Self Practice + Face-Off combined
+WHATSAPP_COMMUNITY_LINK = "https://chat.whatsapp.com/H8PIympR9THDvxSuAfNXhs"
+WEBSITE_LINK = "https://www.pyrexiamed.com"
+IST = timezone(timedelta(hours=5, minutes=30))
+
 SUPABASE_URL = "https://veyesmsdlyaooepvkjmr.supabase.co"
 QUESTIONS_TABLE_URL = f"{SUPABASE_URL}/rest/v1/questions"
 USERS_TABLE_URL = f"{SUPABASE_URL}/rest/v1/users"
 USER_QUESTIONS_URL = f"{SUPABASE_URL}/rest/v1/user_questions"
 BROADCAST_READS_URL = f"{SUPABASE_URL}/rest/v1/broadcast_reads"
+DAILY_USAGE_URL = f"{SUPABASE_URL}/rest/v1/daily_usage"
 
 HEADERS = {
     "apikey": "sb_publishable_98PpqkF49oh36BAQYIFB1A_hA0vl0-7",
@@ -57,9 +65,6 @@ MOTIVATIONAL_MESSAGE = (
 INSTAGRAM_MESSAGE = (
     "🌟 Want more? We've got you covered!\n\n"
     "📲 Follow *@pyrexiamed* on Instagram for:\n"
-    "• 📝 Daily PYQs & Notes\n"
-    "• 🧠 Quizzes with Prizes 🎁\n"
-    "• 🔥 Exclusive Study Material\n\n"
     "👉 https://www.instagram.com/pyrexiamed\n\n"
     "Join the community & level up your prep! 🚀"
 )
@@ -140,6 +145,80 @@ def save_user(user):
         )
     except:
         pass
+
+
+# ================= DAILY QUIZ LIMIT HELPERS =================
+def get_today_date_str():
+    """Date string in IST, used as the daily-reset boundary."""
+    return datetime.now(IST).strftime("%Y-%m-%d")
+
+
+def get_quiz_count_today(user_id):
+    today = get_today_date_str()
+    try:
+        r = requests.get(
+            f"{DAILY_USAGE_URL}?user_id=eq.{user_id}&date=eq.{today}&select=quizzes_played",
+            headers=HEADERS,
+            timeout=10
+        )
+        r.raise_for_status()
+        rows = r.json()
+        return rows[0]["quizzes_played"] if rows else 0
+    except Exception:
+        # Fail open would let people bypass the limit; fail closed (treat as 0 used)
+        # is safer for UX than blocking everyone on a transient DB error, so we
+        # log-free fall back to 0 here.
+        return 0
+
+
+def check_daily_limit(user_id):
+    """Returns (count_used_today, remaining_today)."""
+    count = get_quiz_count_today(user_id)
+    remaining = max(0, DAILY_QUIZ_LIMIT - count)
+    return count, remaining
+
+
+def increment_quiz_count(user_id):
+    """Call exactly once per quiz/match that actually starts. Returns new count."""
+    today = get_today_date_str()
+    count = get_quiz_count_today(user_id)
+    new_count = count + 1
+    try:
+        requests.post(
+            f"{DAILY_USAGE_URL}?on_conflict=user_id,date",
+            headers={**HEADERS, "Prefer": "resolution=merge-duplicates"},
+            json={"user_id": user_id, "date": today, "quizzes_played": new_count},
+            timeout=10
+        )
+    except Exception:
+        pass
+    return new_count
+
+
+def limit_reached_message():
+    return (
+        f"🚫 You've used all {DAILY_QUIZ_LIMIT} free quizzes for today on Telegram!\n\n"
+        "Join our WhatsApp community to unlock *unlimited* quizzes — with a detailed "
+        "explanation for every single question — on our website 👇\n\n"
+        f"📲 WhatsApp Community: {WHATSAPP_COMMUNITY_LINK}\n"
+        f"🌐 Website: {WEBSITE_LINK}\n\n"
+        "Your free Telegram quizzes reset tomorrow. See you then! 🔥"
+    )
+
+
+def completion_upsell_message(remaining):
+    if remaining > 0:
+        status_line = f"📊 You have {remaining}/{DAILY_QUIZ_LIMIT} free quizzes left today on Telegram.\n\n"
+    else:
+        status_line = f"📊 You've used all {DAILY_QUIZ_LIMIT} free quizzes for today on Telegram.\n\n"
+
+    return (
+        status_line +
+        MOTIVATIONAL_MESSAGE +
+        "🚀 Want *unlimited* quizzes with an explanation for every question?\n"
+        f"📲 Join our WhatsApp community: {WHATSAPP_COMMUNITY_LINK}\n"
+        f"🌐 Then practice unlimited PYQs on: {WEBSITE_LINK}\n"
+    )
 
 
 # ================= QUESTION TRACKING =================
@@ -238,6 +317,14 @@ async def subject_handler(update, context):
 # ================= SELF QUIZ =================
 async def start_self_quiz(chat_id, context):
     user_id = context._user_id
+
+    # --- daily limit check, before we even fetch questions ---
+    _, remaining = check_daily_limit(user_id)
+    if remaining <= 0:
+        await context.bot.send_message(chat_id, limit_reached_message(), parse_mode="Markdown")
+        context.user_data.clear()
+        return
+
     questions = fetch_questions(
         context.user_data["class"],
         context.user_data.get("subject"),
@@ -249,13 +336,17 @@ async def start_self_quiz(chat_id, context):
         context.user_data.clear()
         return
 
+    # Count this as one of today's quizzes now that we know it will actually run
+    new_count = increment_quiz_count(user_id)
+
     context.user_data.update({
         "questions": questions[:QUESTIONS_PER_QUIZ],
         "current_q": 0,
         "score": 0,
         "answered": False,
         "timer_task": None,
-        "timer_msg_id": None
+        "timer_msg_id": None,
+        "quiz_number_today": new_count
     })
 
     await send_self_question(chat_id, context)
@@ -303,10 +394,14 @@ async def send_self_question(chat_id, context):
     questions = context.user_data["questions"]
 
     if idx >= len(questions):
+        quiz_number_today = context.user_data.get("quiz_number_today", DAILY_QUIZ_LIMIT)
+        remaining = max(0, DAILY_QUIZ_LIMIT - quiz_number_today)
+
         await context.bot.send_message(
             chat_id,
             f"🎉 Quiz Finished!\nScore: {context.user_data['score']} / {len(questions)}\n\n"
-            f"{MOTIVATIONAL_MESSAGE}"
+            f"{completion_upsell_message(remaining)}",
+            parse_mode="Markdown"
         )
         await context.bot.send_message(chat_id, INSTAGRAM_MESSAGE, parse_mode="Markdown")
         context.user_data.clear()
@@ -377,12 +472,23 @@ async def add_to_faceoff_queue(query, context):
     chat_id = query.message.chat_id
     user_class = context.user_data["class"]
 
+    # --- daily limit check, before queueing for a match ---
+    _, remaining = check_daily_limit(user_id)
+    if remaining <= 0:
+        await query.edit_message_text(limit_reached_message(), parse_mode="Markdown")
+        context.user_data.clear()
+        return
+
     for waiting in FACE_OFF_QUEUE:
         if waiting["class"] == user_class and waiting["user_id"] != user_id:
             FACE_OFF_QUEUE.remove(waiting)
             match_id = f"{waiting['user_id']}_{user_id}"
 
             questions = fetch_questions(user_class)[:QUESTIONS_PER_MATCH]
+
+            # Count this match against today's quota for BOTH players now that it's actually starting
+            quiz_number_waiting = increment_quiz_count(waiting["user_id"])
+            quiz_number_current = increment_quiz_count(user_id)
 
             ACTIVE_MATCHES[match_id] = {
                 "questions": questions,
@@ -391,6 +497,10 @@ async def add_to_faceoff_queue(query, context):
                 "finish_task": None,
                 "ended": False,
                 "countdown_msgs": {},
+                "quiz_numbers": {
+                    waiting["user_id"]: quiz_number_waiting,
+                    user_id: quiz_number_current
+                },
                 "players": {
                     waiting["user_id"]: {
                         "chat_id": waiting["chat_id"],
@@ -542,6 +652,9 @@ async def end_faceoff(match_id, context):
             pass
 
     (u1, p1), (u2, p2) = match["players"].items()
+    quiz_numbers = match.get("quiz_numbers", {})
+    remaining1 = max(0, DAILY_QUIZ_LIMIT - quiz_numbers.get(u1, DAILY_QUIZ_LIMIT))
+    remaining2 = max(0, DAILY_QUIZ_LIMIT - quiz_numbers.get(u2, DAILY_QUIZ_LIMIT))
 
     if p1["score"] > p2["score"]:
         m1, m2 = "🏆 You Win!", "❌ You Lose"
@@ -552,13 +665,15 @@ async def end_faceoff(match_id, context):
 
     await context.bot.send_message(
         p1["chat_id"],
-        f"{m1}\nScore: {p1['score']} – {p2['score']}\n\n{MOTIVATIONAL_MESSAGE}"
+        f"{m1}\nScore: {p1['score']} – {p2['score']}\n\n{completion_upsell_message(remaining1)}",
+        parse_mode="Markdown"
     )
     await context.bot.send_message(p1["chat_id"], INSTAGRAM_MESSAGE, parse_mode="Markdown")
 
     await context.bot.send_message(
         p2["chat_id"],
-        f"{m2}\nScore: {p2['score']} – {p1['score']}\n\n{MOTIVATIONAL_MESSAGE}"
+        f"{m2}\nScore: {p2['score']} – {p1['score']}\n\n{completion_upsell_message(remaining2)}",
+        parse_mode="Markdown"
     )
     await context.bot.send_message(p2["chat_id"], INSTAGRAM_MESSAGE, parse_mode="Markdown")
 
