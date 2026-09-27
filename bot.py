@@ -213,7 +213,7 @@ def completion_upsell_message(remaining):
         status_line +
         MOTIVATIONAL_MESSAGE +
         "🚀 Want *unlimited* quizzes with an explanation for every question?\n"
-        f"📲 Join our WhatsApp community: {WHATSAPP_COMMUNITY_LINK}\n"
+        f"📲 Join our WhatsApp community for daily NEET PG MCQs: {WHATSAPP_COMMUNITY_LINK}\n"
         f"🌐 Then practice unlimited PYQs on: {WEBSITE_LINK}\n"
     )
 
